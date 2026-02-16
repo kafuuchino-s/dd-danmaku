@@ -1,4 +1,69 @@
 #### 1.48 待发布
+feat: 新增 TMDB + Bangumi + Bgmtv 精确匹配功能，利用 Emby 元数据自动匹配弹幕
+- 从 Emby 获取 TMDB ID、季度号（ParentIndexNumber）、集号（IndexNumber）
+- 调用 DandanPlay `/bangumi/tmdb-{tv|movie}-{id}` 获取作品信息
+- 从 titles 数组中提取原始标题（language: "原始标题"）
+- 从 seasons 数组中提取对应季度的播出日期（seasons[seasonNumber-1].airDate）
+- 使用原始标题 + 播出日期调用 Bangumi API 精确搜索，API 请求时添加 air_date 过滤（±10天范围）
+- Bangumi 搜索按 platform 字段过滤类型：platform 为 "剧场版" 或 "电影" 视为电影，否则为 TV
+- 类型匹配失败时，使用第一个结果（日期已通过 API 过滤匹配，处理 TMDB 分类为 TV 但 Bangumi 分类为剧场版的情况）
+- 获取 Bangumi subject id 后，优先调用 DandanPlay `/bangumi/bgmtv/{id}` 直接获取真实 episodeId
+- 如果 bgmtv 接口无结果，回退使用 Bangumi 源语言标题（name 字段）搜索 DandanPlay
+- 流程：TMDB ID → 原始标题+播出日期 → Bangumi 精确搜索(±10天) → bgmtv 直接匹配 / 标题搜索 → 弹幕
+
+refactor: 优化弹幕匹配流程
+- 新匹配顺序：推理匹配 → Hash匹配（可选精确）→ TMDB+Bangumi → 智能匹配（使用Hash候选列表）→ 标题搜索
+- 推理匹配优先级最高：基于用户上次确认的结果，减少额外匹配请求
+- 首次播放走完整流程，后续同季播放通过推理匹配直接命中
+- Hash 返回 `isMatched: true` 时直接使用结果
+- Hash 返回 `isMatched: false` 时保存候选列表，供 TMDB 失败后智能匹配使用
+- 删除废弃的 `tmdbAutoFailback()` 函数
+
+feat: 新增精确 Hash 匹配功能，可选使用视频文件前 16MB 的真实 MD5 哈希进行弹弹Play匹配
+- 新增 `精确Hash匹配` 设置开关（默认关闭），开启后播放时会下载视频前 16MB 计算真实 MD5
+- 哈希值按 `mediaSourceId + fileSize` 缓存至 localStorage，避免重复下载计算
+- 清除本地缓存时会一并清除哈希缓存
+- 使用 SparkMD5 库进行增量式 ArrayBuffer MD5 计算
+- 未开启时使用假哈希进行匹配（原有行为），不影响现有功能
+
+feat: 增强集数推理匹配功能
+- 支持任意跳集推理，不再限于仅上一集/下一集
+- 优先按 episodeNumber 字段精确匹配 episodeId，避免 SP/OVA 导致的索引偏移问题
+- episodeNumber 匹配不到时使用差值偏移计算作为 fallback
+- 手动匹配一次后，同季其他集数可通过推理快速匹配（season=0 场景按规则回退）
+- 推理失败时自动回退到常规匹配流程
+- 同一集重新播放时直接复用上次匹配结果，无需重新匹配
+- 推理匹配信息持久化到 localStorage，重启客户端后仍可推理匹配
+
+fix: 修复手动匹配后下一集推理使用错误 episodeId 的问题
+- 修复手动匹配成功后保存的是旧 episode_info 而不是新 episodeInfo 的问题
+- 修复自动匹配成功后保存的是旧 episode_info 而不是新 info 的问题
+- 修复推理匹配成功后未更新 localStorage 导致连续推理或重播出错的问题
+- 修复 `episodeIndex` 重复减1的问题（`searchDanmakuOpts.episode` 已是 0-based 索引）
+- 修复手动匹配对话框中集数选择默认值少1的问题
+
+fix: 修复推理匹配在弹幕为0时错误回退的问题
+- 修改判断条件为 `comments !== null`，只要 episodeId 存在就使用推理结果
+- 有些剧集确实没有弹幕，不应因此回退到常规匹配
+
+feat: 推理匹配时从缓存获取真实 episodeTitle
+- 统一使用 `_anime_episodes_{animeId}` 缓存 episodes 数组
+- 手动匹配时缓存选中 anime 的 episodes
+- bgmtv 接口返回时也缓存到同一位置
+- 推理匹配从统一缓存中查找真实剧集标题
+- 差值计算后，用推理出的 episodeId 再次从缓存查找真实标题，避免显示"第X集(推断)"
+
+feat: 新增 TMDB 匹配过程中的缓存机制，减少重复 API 请求
+- 缓存 TMDB 作品详情（按 `tmdb-{tv|movie}-{id}` 缓存，仅存 titles/seasons/originalTitle）
+- 缓存 Bangumi 搜索结果（按 `title + airDate` 缓存）
+- 缓存 Bgmtv 作品详情（按 `bgmtv-{subjectId}` 缓存）
+- 统一 episodes 缓存（按 `animeId` 缓存），来源：手动匹配 / bgmtv 接口
+- 注意：TMDB 源的 episodeId/animeId 与 DandanPlay 原生不同，不混入 episodes 缓存
+- 同一部剧播放不同集数时，仅首次请求 API，后续集数直接使用缓存
+- 清除本地缓存时会一并清除这些缓存
+
+fix: 修复 `window.ede.danmaku.destroy is not a function` 报错
+- 调用 `destroy()` 前检查是否为函数，兼容 quickDebug 模式下的普通对象
 
 #### 1.47
 fix: 修复播放页高能进度条和时钟永久开问题
