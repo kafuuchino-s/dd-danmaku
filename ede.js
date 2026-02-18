@@ -782,16 +782,28 @@
             try {
                 const cachedData = JSON.parse(cached);
                 console.log(`[TMDB匹配] 使用缓存: ${cachedData.animeTitle}`);
-                // 从缓存数据中重新提取对应季度的播出日期
-                let airDate = null;
-                if (cachedData.seasons && cachedData.seasons.length > 0) {
-                    const sn = String(seasonNumber);
-                    const targetSeason = cachedData.seasons.find(s => String(s.id) === sn) || cachedData.seasons[0] || null;
-                    if (targetSeason && targetSeason.airDate) {
-                        airDate = targetSeason.airDate.split('T')[0];
+
+                // 旧版本电影缓存没有 movieAirDate，跳过缓存并重新请求一次
+                if (isMovie && !cachedData.movieAirDate) {
+                    console.log(`[TMDB匹配] 电影缓存缺少上映日期，忽略缓存并重新请求`);
+                } else {
+                    // 从缓存数据中重新提取对应季度的播出日期
+                    let airDate = null;
+
+                    // 电影：优先使用缓存中的首映日期
+                    if (isMovie && cachedData.movieAirDate) {
+                        airDate = cachedData.movieAirDate;
                     }
+
+                    if (!airDate && cachedData.seasons && cachedData.seasons.length > 0) {
+                        const sn = String(seasonNumber);
+                        const targetSeason = cachedData.seasons.find(s => String(s.id) === sn) || cachedData.seasons[0] || null;
+                        if (targetSeason && targetSeason.airDate) {
+                            airDate = targetSeason.airDate.split('T')[0];
+                        }
+                    }
+                    return { ...cachedData, airDate };
                 }
-                return { ...cachedData, airDate };
             } catch (e) {
                 localStorage.removeItem(cacheKey);
             }
@@ -820,10 +832,19 @@
                 }
             }
 
+            // 优先：movie 时使用 TMDB episodes 第一集（或可用条目）的 airDate 作为上映日期
+            let airDate = null;
+            if (isMovie && bangumi.episodes && bangumi.episodes.length > 0) {
+                const movieEp = bangumi.episodes.find(ep => ep && ep.airDate) || null;
+                if (movieEp && movieEp.airDate) {
+                    airDate = movieEp.airDate.split('T')[0];
+                    console.log(`[TMDB匹配] 电影上映日期: ${airDate}`);
+                }
+            }
+
             // 优先：season=0 时使用 TMDB episodes 的单集 airDate
             // TMDB 的 season 0 往往混合了 OVA/特别篇等多种条目，因此用“单集日期”做 Bangumi 日期过滤更可靠。
-            let airDate = null;
-            if (seasonNumber === 0 && episodeNumber !== null && episodeNumber !== undefined && bangumi.episodes && bangumi.episodes.length > 0) {
+            if (!airDate && seasonNumber === 0 && episodeNumber !== null && episodeNumber !== undefined && bangumi.episodes && bangumi.episodes.length > 0) {
                 const epNum = parseInt(episodeNumber, 10);
                 if (!isNaN(epNum)) {
                     // 优先按 seasonId(季号) + episodeNumber 锁定到 S00E??；若接口未返回 seasonId，则退化为仅按 episodeNumber
@@ -860,6 +881,7 @@
                 titles: bangumi.titles,
                 seasons: bangumi.seasons,
                 originalTitle: originalTitle || bangumi.animeTitle,
+                movieAirDate: isMovie ? airDate : null,
             };
             localStorage.setItem(cacheKey, JSON.stringify(cacheData));
 
@@ -1334,6 +1356,7 @@
         } else {
             _id = item.Id;
             animeName = item.Name;
+            episodeName = animeName;
             episode = 'movie';
         }
         let _id_key = lsLocalKeys.animePrefix + _id;
@@ -1860,6 +1883,14 @@
      * @returns {{title: string, season: number|null, episode: number|null}}
      */
     function parseAnimeName(animeName) {
+        if (!animeName || typeof animeName !== 'string') {
+            return {
+                title: '',
+                season: null,
+                episode: null
+            };
+        }
+
         const match = animeName.match(/^(.*?)\s*[Ss](\d{1,2})[Ee](\d{1,4})\b/);
         if (match) {
             return {
