@@ -295,6 +295,8 @@
         bgmtvBangumiPrefix: '_bgmtv_bangumi_',    // Bgmtv 作品详情缓存
         // 手动匹配缓存
         animeEpisodesPrefix: '_anime_episodes_',  // 手动匹配时的 anime episodes 缓存（按 animeId）
+        // 轴偏秒缓存
+        timelineOffsetPrefix: '_timeline_offset_', // 按季度记忆的轴偏秒缓存
         // 推理匹配缓存
         previousEpisodeInfo: '_previous_episode_info',  // 上次播放的剧集信息，用于推理匹配
     };
@@ -1440,6 +1442,7 @@
             _id_key: _id_key,
             _season_key: _season_key,
             _episode_key: _episode_key,
+            seasonCacheId: _id,
             animeId: animeId,
             episode: episode, // this is episode index, not a program index
             animeName: animeName,
@@ -2230,7 +2233,8 @@
     async function getEpisodeInfo(is_auto = true) {
         const itemInfoMap = await getMapByEmbyItemInfo();
         if (!itemInfoMap) { return null; }
-        const { _episode_key, animeId, episode, seriesOrMovieId, seasonNumber } = itemInfoMap;
+        const { _episode_key, animeId, episode, seriesOrMovieId, seasonNumber, seasonCacheId } = itemInfoMap;
+        syncTimelineOffsetBySeason(seasonCacheId);
 
         // 集数推理逻辑（基于 DandanPlay episodeId 连续的特性）
         // 从 localStorage 读取上次播放的剧集信息
@@ -2440,6 +2444,7 @@
                 apiPrefix: res.apiPrefix,
                 seriesOrMovieId: seriesOrMovieId,
                 seasonNumber: itemInfoMap.seasonNumber,
+                seasonCacheId: itemInfoMap.seasonCacheId,
             };
             window.localStorage.setItem(unique_episode_key, JSON.stringify(episodeInfo));
             // 预先获取完整 episodes 列表并缓存，供后续推理匹配使用
@@ -2476,6 +2481,7 @@
             animeOriginalTitle,
             seriesOrMovieId: seriesOrMovieId,
             seasonNumber: itemInfoMap.seasonNumber,
+            seasonCacheId: itemInfoMap.seasonCacheId,
         };
         localStorage.setItem(unique_episode_key, JSON.stringify(episodeInfo));
         // 缓存 anime 的 episodes 数组，用于推理匹配时获取真实 episodeTitle
@@ -3140,10 +3146,12 @@
     async function afterEmbyDialogCreated(dialogContainer) {
         const itemInfoMap = await getMapByEmbyItemInfo();
         if (itemInfoMap) {
+            syncTimelineOffsetBySeason(itemInfoMap.seasonCacheId);
             window.ede.searchDanmakuOpts = {
                 _id_key: itemInfoMap._id_key,
                 _season_key: itemInfoMap._season_key,
                 _episode_key: itemInfoMap._episode_key,
+                seasonCacheId: itemInfoMap.seasonCacheId,
                 animeId: itemInfoMap.animeId,
                 animeName: itemInfoMap.animeName,
                 seriesOrMovieId: itemInfoMap.seriesOrMovieId,
@@ -3303,7 +3311,7 @@
         const btnContainer = getById(eleIds.timelineOffsetDiv, container);
         const nextEle = btnContainer.nextElementSibling;
         const labelEle = nextEle.children.length > 0 ? nextEle.children[0] : nextEle;
-        const timelineOffsetOpts = { lsKey: lsKeys.timelineOffset, labelEle };
+        const timelineOffsetOpts = { lsKey: lsKeys.timelineOffset, labelEle, seasonCacheId: window.ede.episode_info?.seasonCacheId || window.ede.searchDanmakuOpts?.seasonCacheId };
         onSliderChangeLabel(lsGetItem(lsKeys.timelineOffset.id), timelineOffsetOpts);
         timeOffsetBtns.forEach(btn => {
             btnContainer.append(embyButton(btn, (e) => {
@@ -3610,6 +3618,7 @@
                     lsLocalKeys.bangumiSearchPrefix,
                     lsLocalKeys.bgmtvBangumiPrefix,
                     lsLocalKeys.animeEpisodesPrefix,
+                    lsLocalKeys.timelineOffsetPrefix,
                     lsLocalKeys.previousEpisodeInfo,
                 ];
                 lsBatchRemove(prefixesToClear);
@@ -4849,7 +4858,7 @@
 
         // 构造一个更完整的 episodeInfo 对象
         // 注意：searchDanmakuOpts.episode 已经是 0-based 索引（在 afterEmbyDialogCreated 中减了1）
-        const { _episode_key, seriesOrMovieId, seasonNumber, episode } = window.ede.searchDanmakuOpts;
+        const { _episode_key, seriesOrMovieId, seasonNumber, episode, seasonCacheId } = window.ede.searchDanmakuOpts;
         const episodeInfo = {
             episodeId: episodeNumSelect.value,
             episodeTitle: episodeNumSelect.options[episodeNumSelect.selectedIndex].text,
@@ -4861,6 +4870,7 @@
             imageUrl: anime.imageUrl,
             seriesOrMovieId: seriesOrMovieId,
             seasonNumber: seasonNumber,
+            seasonCacheId: seasonCacheId,
             apiPrefix: anime.apiPrefix,
             apiName: anime.apiName,
         };
@@ -4971,6 +4981,10 @@
     function onSliderChange(val, opts) {
         onSliderChangeLabel(opts.label ? opts.label : val, opts);
         if (opts.lsKey.id && lsCheckSet(opts.lsKey.id, val)) {
+            if (opts.lsKey.id === lsKeys.timelineOffset.id) {
+                const seasonCacheId = opts.seasonCacheId || window.ede.episode_info?.seasonCacheId || window.ede.searchDanmakuOpts?.seasonCacheId;
+                setTimelineOffsetBySeason(seasonCacheId, val);
+            }
             let needReload = opts.needReload === undefined ? true : opts.needReload;
             if (opts.isManual) {
                 needReload = false;
@@ -5411,6 +5425,35 @@
             .map(([key, value]) => [value.id, value.defaultValue])
         );
         lsBatchSet(defaultSettings);
+        lsBatchRemove([lsLocalKeys.timelineOffsetPrefix]);
+    }
+
+    function getTimelineOffsetCacheKey(seasonCacheId) {
+        if (seasonCacheId === undefined || seasonCacheId === null || seasonCacheId === '') {
+            return null;
+        }
+        return `${lsLocalKeys.timelineOffsetPrefix}${seasonCacheId}`;
+    }
+
+    function getTimelineOffsetBySeason(seasonCacheId) {
+        const cacheKey = getTimelineOffsetCacheKey(seasonCacheId);
+        if (!cacheKey) {
+            return lsKeys.timelineOffset.defaultValue;
+        }
+        const item = localStorage.getItem(cacheKey);
+        return item === null ? lsKeys.timelineOffset.defaultValue : parseFloat(item);
+    }
+
+    function setTimelineOffsetBySeason(seasonCacheId, value) {
+        const cacheKey = getTimelineOffsetCacheKey(seasonCacheId);
+        if (!cacheKey) { return; }
+        localStorage.setItem(cacheKey, value);
+    }
+
+    function syncTimelineOffsetBySeason(seasonCacheId) {
+        const timelineOffset = getTimelineOffsetBySeason(seasonCacheId);
+        lsSetItem(lsKeys.timelineOffset.id, timelineOffset);
+        return timelineOffset;
     }
 
     // 缓存相关方法
@@ -5732,8 +5775,8 @@
         videoTimeUpdateInterval(null, false);
         // 销毁可能残留的定时器
         destroyAllInterval();
-        // 退出播放页面重置轴偏秒
-        lsSetItem(lsKeys.timelineOffset.id, lsKeys.timelineOffset.defaultValue);
+        // 退出播放页面重置当前季度的轴偏秒到全局显示值
+        syncTimelineOffsetBySeason(window.ede.episode_info?.seasonCacheId || window.ede.searchDanmakuOpts?.seasonCacheId);
     }
 
     function onViewShow(e) {
