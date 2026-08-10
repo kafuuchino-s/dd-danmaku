@@ -578,6 +578,8 @@
         }
     }
 
+    let lastPlaybackItemId = null;
+
     class AppLogAspect {
         constructor() {
             this.initialized = false;
@@ -670,12 +672,34 @@
 
     function onPlaybackStart(e, state) {
         console.log(e.type);
+        const itemId = state?.NowPlayingItem?.Id || state?.ItemId || '';
+        const sessionChanged = lastPlaybackItemId && itemId && lastPlaybackItemId !== itemId;
+        if (sessionChanged) {
+            cleanupPlaybackSession();
+            window.ede = new EDE();
+            if (lsGetItem(lsKeys.consoleLogEnable.id)) {
+                window.ede.appLogAspect = new AppLogAspect().init();
+            }
+            initUI();
+            initH5VideoAdapter();
+            initListener();
+            initCss();
+        }
+        if (!window.ede) {
+            window.ede = new EDE();
+        }
+        lastPlaybackItemId = itemId || lastPlaybackItemId;
+        if (itemId) {
+            window.ede.itemId = itemId;
+        }
         loadDanmaku(LOAD_TYPE.INIT);
     }
 
     function onPlaybackStop(e, state) {
         console.log(e.type);
-        onPlaybackStopPct(e, state);
+        if (state) {
+            onPlaybackStopPct(e, state);
+        }
         if (lsGetItem(lsKeys.osdHeaderClockEnable.id)) {
             removeHeaderClock();
         }
@@ -1164,7 +1188,7 @@
     }
 
     function onPlaybackStopPct(e, state) {
-        if (!state.NowPlayingItem) { return console.log('跳过 Web 端自身错误触发的第二次播放停止事件'); }
+        if (!state?.NowPlayingItem) { return console.log('跳过 Web 端自身错误触发的第二次播放停止事件'); }
         console.log(e.type);
         const positionTicks = state.PlayState.PositionTicks;
         const runtimeTicks = state.NowPlayingItem.RunTimeTicks;
@@ -1174,7 +1198,7 @@
         const bangumiPostPercent = lsGetItem(lsKeys.bangumiPostPercent.id);
         const bangumiToken = lsGetItem(lsKeys.bangumiToken.id);
         if (lsGetItem(lsKeys.bangumiEnable.id) && bangumiToken
-            && pct >= bangumiPostPercent && window.ede.episode_info.episodeId
+            && pct >= bangumiPostPercent && window.ede?.episode_info?.episodeId
         ) {
             console.log(`大于需提交的设定百分比: ${bangumiPostPercent}%`);
             const { animeTitle, episodeTitle } = window.ede.episode_info;
@@ -5754,48 +5778,71 @@
         }
     }
 
-    function beforeDestroy(e) {
-        if (e.detail.type !== 'video-osd') {
+    function cleanupPlaybackSession() {
+        const ede = window.ede;
+        if (!ede) {
             return;
         }
-        // 此段销毁不重要,可有可无,仅是规范使用,清除弹幕,但未销毁 danmaku 实例
-        if (window.ede.danmaku) {
-            window.ede.danmaku.clear();
+        if (ede.appLogAspect?.destroy) {
+            ede.appLogAspect.destroy();
+            ede.appLogAspect = null;
         }
-        // 销毁弹幕按钮容器简单,双 mediaContainerQueryStr 下免去 DOM 位移操作
-        const danmakuCtr = getById(eleIds.danmakuCtr);
-        if (danmakuCtr) {
-            danmakuCtr.remove();
+        try {
+            if (ede.danmaku) {
+                if (typeof ede.danmaku.destroy === 'function') {
+                    ede.danmaku.destroy();
+                } else if (typeof ede.danmaku.clear === 'function') {
+                    ede.danmaku.clear();
+                }
+                ede.danmaku = null;
+            }
+            const danmakuCtr = getById(eleIds.danmakuCtr);
+            if (danmakuCtr) {
+                danmakuCtr.remove();
+            }
+            videoTimeUpdateInterval(null, false);
+            destroyAllInterval();
+            syncTimelineOffsetBySeason(ede.episode_info?.seasonCacheId || ede.searchDanmakuOpts?.seasonCacheId);
+        } catch (error) {
+            console.warn('弹幕播放会话清理失败:', error);
+        } finally {
+            const media = document.querySelector(mediaQueryStr);
+            if (media) {
+                media.removeAttribute('ede_listening');
+            }
         }
-        // const h5VideoAdapterEle = getById(eleIds.h5VideoAdapter);
-        // if (h5VideoAdapterEle) {
-        //     h5VideoAdapterEle.remove();
-        // }
-        // 销毁平滑补充 timeupdate 定时器
-        videoTimeUpdateInterval(null, false);
-        // 销毁可能残留的定时器
-        destroyAllInterval();
-        // 退出播放页面重置当前季度的轴偏秒到全局显示值
-        syncTimelineOffsetBySeason(window.ede.episode_info?.seasonCacheId || window.ede.searchDanmakuOpts?.seasonCacheId);
+    }
+
+    function beforeDestroy(e) {
+        if (e.detail?.type !== 'video-osd' || !window.ede) {
+            return;
+        }
+        cleanupPlaybackSession();
+        lastPlaybackItemId = null;
     }
 
     function onViewShow(e) {
+        if (e.detail?.type !== 'video-osd') {
+            return;
+        }
+        if (window.ede) {
+            cleanupPlaybackSession();
+        }
+        window.ede = new EDE();
+        lastPlaybackItemId = null;
         console.log(e.type, e);
         customeUrl.init();
         lsGetItem(lsKeys.quickDebugOn.id) && !getById(eleIds.danmakuSettingBtnDebug) && quickDebug();
         addEasterEggListener();
-        if (e.detail.type === 'video-osd') {
-            if (!window.ede) { window.ede = new EDE(); }
-            if (!window.ede.appLogAspect && lsGetItem(lsKeys.consoleLogEnable.id)) {
-                window.ede.appLogAspect = new AppLogAspect().init();
-            }
-            initUI();
-            initH5VideoAdapter();
-            // loadDanmaku(LOAD_TYPE.INIT);
-            initListener();
-            initCss();
+        if (!window.ede.appLogAspect && lsGetItem(lsKeys.consoleLogEnable.id)) {
+            window.ede.appLogAspect = new AppLogAspect().init();
         }
-        window.ede.itemId = e.detail.params.id ? e.detail.params.id : '';
+        initUI();
+        initH5VideoAdapter();
+        // loadDanmaku(LOAD_TYPE.INIT);
+        initListener();
+        initCss();
+        window.ede.itemId = e.detail?.params?.id || '';
     }
 
     // emby/jellyfin CustomEvent. see: https://github.com/MediaBrowser/emby-web-defaultskin/blob/822273018b82a4c63c2df7618020fb837656868d/nowplaying/videoosd.js#L698
