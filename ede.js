@@ -203,6 +203,45 @@
         { id: 'official', name: '官方API优先' },
         { id: 'custom', name: '自定义API优先' },
     ];
+    const autoOpAlignmentConfig = {
+        introMinDuration: 50,
+        introMaxDuration: 110,
+        introFallbackMinDuration: 15,
+        introFallbackMaxDuration: 45,
+        windowPaddingBefore: 25,
+        windowPaddingAfter: 25,
+        windowMaxEndOffset: 120,
+        bucketSize: 5,
+        clusterWindowSize: 15,
+        minWindowComments: 8,
+        minKeywordHits: 3,
+        maxAcceptedOffset: 90,
+        hardMaxOffset: 120,
+        startFocusGrace: 10,
+        distancePenaltyWeight: 0.55,
+        commentCountPenaltyWeight: 0.05,
+        skipKeywordPenaltyWeight: 1.2,
+        postIntroPenalty: 3.5,
+        seasonMinConfidence: 0.85,
+        seasonMinSampleCount: 3,
+        seasonOutlierTolerance: 4,
+        seasonSparseMinConfidence: 1,
+        seasonSparseMinSampleCount: 2,
+        seasonSparseOutlierTolerance: 1.5,
+        seasonBaselineCacheVersion: 4,
+        earlyAnchorMinOffset: 5,
+        earlyAnchorMaxOffset: 12,
+        earlyAnchorMinStrongHits: 2,
+        earlyAnchorSingleHitMinStrongTotal: 8,
+        chapterPairConfirmEnable: true,
+        chapterPairTargetDuration: 90,
+        chapterPairDurationTolerance: 8,
+        chapterPairMaxStartDelta: 6,
+        positiveKeywords: [/(^|[^a-z])op([^a-z]|$)/i, /\bopening\b/i, '片头', '片头曲', '空降', '跳op', '不跳op', '开场'],
+        negativeKeywords: [/(^|[^a-z])ed([^a-z]|$)/i, /\bending\b/i, '片尾'],
+        strongKeywords: [/(^|[^a-z])op([^a-z]|$)/i, /\bopening\b/i, '片头', '片头曲', /不跳\s*op/i],
+        skipKeywords: ['空降成功', '空降'],
+    };
     let timeoutCallbackId;
     const timeoutCallbackClear = () => timeoutCallbackId && clearTimeout(timeoutCallbackId);
     const timeoutCallbackTypeOpts = [
@@ -227,6 +266,7 @@
         fontOpacity: { id: 'danmakuFontOpacity', defaultValue: 1, name: '透明度', min: 0.1, max: 1, step: 0.1 },
         speed: { id: 'danmakuBaseSpeed', defaultValue: 1, name: '速度', min: 0.1, max: 3, step: 0.1 },
         timelineOffset: { id: 'danmakuTimelineOffset', defaultValue: 0, name: '轴偏秒' },
+        autoOpAlignEnable: { id: 'danmakuAutoOpAlignEnable', defaultValue: true, name: '自动 OP 对齐' },
         fontWeight: { id: 'danmakuFontWeight', defaultValue: 400, name: '弹幕粗细', min: 100, max: 1000, step: 100 },
         fontStyle: { id: 'danmakuFontStyle', defaultValue: 0, name: '弹幕斜体', min: 0, max: 2, step: 1 },
         fontFamily: { id: 'danmakuFontFamily', defaultValue: 'sans-serif', name: '字体' },
@@ -297,6 +337,7 @@
         animeEpisodesPrefix: '_anime_episodes_',  // 手动匹配时的 anime episodes 缓存（按 animeId）
         // 轴偏秒缓存
         timelineOffsetPrefix: '_timeline_offset_', // 按季度记忆的轴偏秒缓存
+        seasonAutoTimelineOffsetPrefix: '_season_auto_timeline_offset_', // 按季度聚合的自动OP偏移缓存
         // 推理匹配缓存
         previousEpisodeInfo: '_previous_episode_info',  // 上次播放的剧集信息，用于推理匹配
     };
@@ -575,10 +616,827 @@
             this.bangumiInfo = {};
             this.itemId = '';
             this.tempLsValues = {}; // 临时存储的由程序更改后的 ls 值
+            this.autoTimelineOffset = 0;
+            this.autoTimelineOffsetMeta = null;
+            this.introInfo = null;
         }
     }
 
     let lastPlaybackItemId = null;
+
+    function resetAutoTimelineOffsetState() {
+        if (!window.ede) { return; }
+        window.ede.autoTimelineOffset = 0;
+        window.ede.autoTimelineOffsetMeta = null;
+        window.ede.introInfo = null;
+    }
+
+    function getManualTimelineOffset() {
+        return lsGetItem(lsKeys.timelineOffset.id);
+    }
+
+    function getSeasonAutoTimelineOffsetCacheKey(seasonCacheId) {
+        if (seasonCacheId === undefined || seasonCacheId === null || seasonCacheId === '') {
+            return null;
+        }
+        return `${lsLocalKeys.seasonAutoTimelineOffsetPrefix}${seasonCacheId}`;
+    }
+
+    function median(nums) {
+        if (!nums.length) { return null; }
+        const sorted = [...nums].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+    }
+
+    function getCurrentSeasonCacheId() {
+        return window.ede?.episode_info?.seasonCacheId || window.ede?.searchDanmakuOpts?.seasonCacheId || null;
+    }
+
+    function getSeasonAutoTimelineOffsetBaseline(seasonCacheId = getCurrentSeasonCacheId()) {
+        const cacheKey = getSeasonAutoTimelineOffsetCacheKey(seasonCacheId);
+        if (!cacheKey) { return null; }
+        const item = localStorage.getItem(cacheKey);
+        if (!item) { return null; }
+        try {
+            const parsed = JSON.parse(item);
+            if (typeof parsed?.offset !== 'number' || !Number.isFinite(parsed.offset)) {
+                return null;
+            }
+            if ((parsed.version || 1) !== autoOpAlignmentConfig.seasonBaselineCacheVersion) {
+                localStorage.removeItem(cacheKey);
+                return null;
+            }
+            return parsed;
+        } catch (error) {
+            localStorage.removeItem(cacheKey);
+            return null;
+        }
+    }
+
+    function setSeasonAutoTimelineOffsetBaseline(seasonCacheId, baseline) {
+        const cacheKey = getSeasonAutoTimelineOffsetCacheKey(seasonCacheId);
+        if (!cacheKey) { return null; }
+        if (!baseline) {
+            localStorage.removeItem(cacheKey);
+            return null;
+        }
+        localStorage.setItem(cacheKey, JSON.stringify(baseline));
+        return baseline;
+    }
+
+    function getMediaServerApiBaseUrl() {
+        const serverAddress = (ApiClient.serverAddress() || '').replace(/\/$/, '');
+        if (!serverAddress) { return ''; }
+        if (serverAddress.endsWith('/emby') || serverAddress.endsWith('/jellyfin')) {
+            return serverAddress;
+        }
+        return ApiClient.appName().toLowerCase().includes('emby') ? `${serverAddress}/emby` : serverAddress;
+    }
+
+    function findSeasonBangumiEpisode(episodes, episodeNumber) {
+        if (!Array.isArray(episodes) || !episodes.length || !episodeNumber) {
+            return null;
+        }
+        const episodeNumberText = String(episodeNumber).trim();
+        const exactEpisode = episodes.find(ep => String(ep.episodeNumber || '').trim() === episodeNumberText);
+        if (exactEpisode) {
+            return exactEpisode;
+        }
+        return episodeNumber > 0 && episodeNumber <= episodes.length ? episodes[episodeNumber - 1] : null;
+    }
+
+    async function fetchSeasonEpisodeItems(currentEpisodeInfo) {
+        const seasonCacheId = currentEpisodeInfo?.seasonCacheId;
+        const animeId = currentEpisodeInfo?.animeId;
+        if (!seasonCacheId || !animeId) {
+            return [];
+        }
+        const episodesData = await fetchEpisodesByAnimeId(animeId);
+        const bangumiEpisodes = episodesData?.episodes || [];
+        if (!bangumiEpisodes.length) {
+            return [];
+        }
+        const apiBaseUrl = getMediaServerApiBaseUrl();
+        const userId = ApiClient.getCurrentUserId();
+        const token = ApiClient.accessToken();
+        if (!apiBaseUrl || !userId || !token) {
+            return [];
+        }
+        const episodeItemsUrl = `${apiBaseUrl}/Users/${userId}/Items?ParentId=${encodeURIComponent(seasonCacheId)}&Recursive=true&IncludeItemTypes=Episode&SortBy=SortName&Fields=Chapters&X-Emby-Token=${encodeURIComponent(token)}`;
+        const seasonItemsResponse = await fetchJson(episodeItemsUrl).catch((error) => {
+            console.warn('[自动OP][季度] 获取季度剧集列表失败:', error);
+            return null;
+        });
+        const seasonItems = Array.isArray(seasonItemsResponse?.Items) ? seasonItemsResponse.Items : [];
+        const seasonEpisodeInfos = [];
+        for (const seasonItem of seasonItems) {
+            const episodeNumber = Number(seasonItem?.IndexNumber);
+            if (!Number.isFinite(episodeNumber) || episodeNumber <= 0) {
+                continue;
+            }
+            const bangumiEpisode = findSeasonBangumiEpisode(bangumiEpisodes, episodeNumber);
+            if (!bangumiEpisode?.episodeId) {
+                continue;
+            }
+            let introInfo = resolveIntroInfo(seasonItem, seasonItem);
+            if (!introInfo) {
+                const fullSeasonItem = await fatchEmbyItemInfo(seasonItem.Id).catch((error) => {
+                    console.warn(`[自动OP][季度] 获取第${episodeNumber}集完整媒体信息失败:`, error);
+                    return null;
+                });
+                introInfo = resolveIntroInfo(seasonItem, fullSeasonItem);
+            }
+            if (!introInfo) {
+                continue;
+            }
+            seasonEpisodeInfos.push({
+                seasonItemId: seasonItem.Id,
+                episodeNumber,
+                episodeId: bangumiEpisode.episodeId,
+                episodeTitle: bangumiEpisode.episodeTitle,
+                introInfo,
+            });
+        }
+        return seasonEpisodeInfos;
+    }
+
+    function buildSeasonAutoTimelineOffsetBaselineFromSamples(samples, options = {}) {
+        if (!Array.isArray(samples) || samples.length === 0) {
+            return null;
+        }
+        const minSampleCount = options.minSampleCount || autoOpAlignmentConfig.seasonMinSampleCount;
+        const outlierTolerance = options.outlierTolerance || autoOpAlignmentConfig.seasonOutlierTolerance;
+        if (samples.length < minSampleCount) {
+            return null;
+        }
+        const rawMedian = median(samples.map(sample => sample.offset));
+        const filteredSamples = samples.filter(sample => Math.abs(sample.offset - rawMedian) <= outlierTolerance);
+        if (filteredSamples.length < minSampleCount) {
+            return null;
+        }
+        return {
+            offset: median(filteredSamples.map(sample => sample.offset)),
+            sampleCount: filteredSamples.length,
+            samples: filteredSamples,
+        };
+    }
+
+    async function buildSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo) {
+        const seasonEpisodeInfos = await fetchSeasonEpisodeItems(currentEpisodeInfo);
+        if (seasonEpisodeInfos.length === 0) {
+            return null;
+        }
+        const samples = [];
+        const sparseSamples = [];
+        for (const info of seasonEpisodeInfos) {
+            const comments = await fetchComment(info.episodeId).catch((error) => {
+                console.warn(`[自动OP][季度] 获取第${info.episodeNumber}集弹幕失败:`, error);
+                return null;
+            });
+            if (!Array.isArray(comments) || comments.length === 0) {
+                continue;
+            }
+            const detection = detectOpDanmakuCluster(comments, info.introInfo, 0);
+            if (detection.status !== 'applied') {
+                continue;
+            }
+            const sample = {
+                episodeNumber: info.episodeNumber,
+                episodeId: info.episodeId,
+                offset: detection.autoOffset,
+                confidence: detection.confidence,
+                clusterStrategy: detection.clusterStrategy,
+            };
+            if ((detection.confidence || 0) >= autoOpAlignmentConfig.seasonMinConfidence
+                && detection.clusterStrategy === 'early-anchor'
+            ) {
+                samples.push(sample);
+            }
+            if ((detection.confidence || 0) >= autoOpAlignmentConfig.seasonSparseMinConfidence
+                && detection.clusterStrategy === 'early-anchor'
+            ) {
+                sparseSamples.push(sample);
+            }
+        }
+        const standardBaseline = buildSeasonAutoTimelineOffsetBaselineFromSamples(samples);
+        if (standardBaseline) {
+            return {
+                ...standardBaseline,
+                strategy: 'standard',
+                version: autoOpAlignmentConfig.seasonBaselineCacheVersion,
+                createdAt: Date.now(),
+            };
+        }
+        const sparseBaseline = buildSeasonAutoTimelineOffsetBaselineFromSamples(sparseSamples, {
+            minSampleCount: autoOpAlignmentConfig.seasonSparseMinSampleCount,
+            outlierTolerance: autoOpAlignmentConfig.seasonSparseOutlierTolerance,
+        });
+        if (sparseBaseline) {
+            return {
+                ...sparseBaseline,
+                strategy: 'sparse-early-anchor',
+                version: autoOpAlignmentConfig.seasonBaselineCacheVersion,
+                createdAt: Date.now(),
+            };
+        }
+        return null;
+    }
+
+    async function ensureSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo) {
+        const seasonCacheId = currentEpisodeInfo?.seasonCacheId;
+        if (!seasonCacheId) {
+            return null;
+        }
+        const cached = getSeasonAutoTimelineOffsetBaseline(seasonCacheId);
+        if (cached) {
+            return cached;
+        }
+        const baseline = await buildSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo);
+        if (!baseline) {
+            return null;
+        }
+        return setSeasonAutoTimelineOffsetBaseline(seasonCacheId, baseline);
+    }
+
+    function getEffectiveTimelineOffset() {
+        return getManualTimelineOffset() + (window.ede?.autoTimelineOffset || 0);
+    }
+
+    function safeFixed(val, digits = 1) {
+        return typeof val === 'number' && Number.isFinite(val) ? val.toFixed(digits) : '--';
+    }
+
+    function formatOffsetSeconds(val) {
+        if (typeof val !== 'number' || !Number.isFinite(val)) { return '--'; }
+        const prefix = val > 0 ? '+' : '';
+        return `${prefix}${val.toFixed(1)}s`;
+    }
+
+    function formatIntroInfo(introInfo) {
+        if (!introInfo || typeof introInfo.start !== 'number' || typeof introInfo.end !== 'number') {
+            return '--';
+        }
+        return `${safeFixed(introInfo.start)}s ~ ${safeFixed(introInfo.end)}s`;
+    }
+
+    function getAutoTimelineOffsetSummary() {
+        const enabled = lsGetItem(lsKeys.autoOpAlignEnable.id);
+        const meta = window.ede?.autoTimelineOffsetMeta;
+        if (!enabled) {
+            return { text: '自动对齐 已关闭', detail: '用户已关闭自动 OP 对齐' };
+        }
+        if (!meta) {
+            return { text: '自动对齐 未执行', detail: '尚未计算自动 OP 对齐' };
+        }
+        const chapterPairText = meta.chapterPairConfirmed && meta.chapterPairConfirmation?.pairStart !== undefined
+            ? ` / 章节对 ${safeFixed(meta.chapterPairConfirmation.pairStart)}s~${safeFixed(meta.chapterPairConfirmation.pairEnd)}s`
+            : '';
+        if (meta.status === 'applied') {
+            const seasonBaselineText = typeof meta.seasonBaselineOffset === 'number'
+                ? ` / 季基线 ${formatOffsetSeconds(meta.seasonBaselineOffset)}`
+                : '';
+            if (meta.sourceType === 'season-baseline') {
+                const seasonEpisodes = meta.seasonEpisodeNumbers?.length ? meta.seasonEpisodeNumbers.join(', ') : '--';
+                return {
+                    text: `自动对齐(季度) ${formatOffsetSeconds(meta.autoOffset)} / 样本${meta.seasonSampleCount || 0}集`,
+                    detail: `季度基线 ${formatOffsetSeconds(meta.seasonBaselineOffset ?? meta.autoOffset)} / 季度样本 ${meta.seasonSampleCount || 0} 集 [${seasonEpisodes}] / 基线策略 ${meta.seasonBaselineStrategy || 'standard'} / 总偏移 ${formatOffsetSeconds(meta.seasonEffectiveOffset)} / 当前集: ${meta.currentEpisodeReason || '已回退到季度基线'}${chapterPairText}`,
+                };
+            }
+            const seasonDetail = meta.seasonSampleCount ? ` / 季度样本 ${meta.seasonSampleCount} 集` : '';
+            return {
+                text: `自动对齐 ${formatOffsetSeconds(meta.autoOffset)}${seasonBaselineText}`,
+                detail: `Intro ${formatIntroInfo(meta.introInfo)} / OP ${safeFixed(meta.opClusterTime)}s / 置信度 ${safeFixed(meta.confidence, 2)}${seasonDetail}${seasonBaselineText}${chapterPairText}`,
+            };
+        }
+        return {
+            text: '自动对齐 回退手动',
+            detail: `${meta.reason || '自动 OP 对齐未命中，已回退到手动季度偏移'}${chapterPairText}`,
+        };
+    }
+
+    function buildAdjacentChapterPairs(chapters) {
+        if (!Array.isArray(chapters) || chapters.length === 0) {
+            return [];
+        }
+        const plainChapters = chapters
+            .filter(chapter => chapter && chapter.MarkerType === 'Chapter' && Number.isFinite(chapter.StartPositionTicks))
+            .map(chapter => ({
+                start: chapter.StartPositionTicks / 1e7,
+                markerType: chapter.MarkerType,
+                name: chapter.Name,
+                chapterIndex: chapter.ChapterIndex,
+            }))
+            .sort((a, b) => a.start - b.start);
+        const pairs = [];
+        for (let i = 0; i < plainChapters.length - 1; i++) {
+            const startChapter = plainChapters[i];
+            const endChapter = plainChapters[i + 1];
+            pairs.push({
+                start: startChapter.start,
+                end: endChapter.start,
+                duration: endChapter.start - startChapter.start,
+                startChapter,
+                endChapter,
+            });
+        }
+        return pairs;
+    }
+
+    function buildIntroInfoFromChapters(chapters, sourceLabel = '') {
+        if (!Array.isArray(chapters) || chapters.length === 0) {
+            return null;
+        }
+        let introStart = null;
+        let introEnd = null;
+        for (let i = 0; i < chapters.length; i++) {
+            const chapter = chapters[i];
+            if (!chapter) { continue; }
+            if (chapter.MarkerType === 'IntroStart') {
+                introStart = chapter.StartPositionTicks;
+            } else if (chapter.MarkerType === 'IntroEnd') {
+                introEnd = chapter.StartPositionTicks;
+            }
+        }
+        if (introStart === null || introEnd === null || introEnd <= introStart) {
+            return null;
+        }
+        const start = introStart / 1e7;
+        const end = introEnd / 1e7;
+        const duration = end - start;
+        const chapterPairs = buildAdjacentChapterPairs(chapters);
+        const plainChapters = chapterPairs.length > 0
+            ? [chapterPairs[0].startChapter, ...chapterPairs.map(pair => pair.endChapter)]
+            : chapters
+                .filter(chapter => chapter && chapter.MarkerType === 'Chapter' && Number.isFinite(chapter.StartPositionTicks))
+                .map(chapter => ({
+                    start: chapter.StartPositionTicks / 1e7,
+                    markerType: chapter.MarkerType,
+                    name: chapter.Name,
+                    chapterIndex: chapter.ChapterIndex,
+                }))
+                .sort((a, b) => a.start - b.start);
+        const nearestPair = chapterPairs
+            .filter(pair => pair.start <= start)
+            .sort((a, b) => Math.abs(a.start - start) - Math.abs(b.start - start))[0] || null;
+        const chapterContext = {
+            plainChapters,
+            nearestPair,
+            source: sourceLabel || undefined,
+        };
+        if (duration >= autoOpAlignmentConfig.introMinDuration && duration <= autoOpAlignmentConfig.introMaxDuration) {
+            return { start, end, duration, chapterContext, markerStart: start, markerEnd: end, markerDuration: duration };
+        }
+        if (duration >= autoOpAlignmentConfig.introFallbackMinDuration
+            && duration <= autoOpAlignmentConfig.introFallbackMaxDuration
+            && nearestPair
+        ) {
+            const durationDelta = Math.abs(nearestPair.duration - autoOpAlignmentConfig.chapterPairTargetDuration);
+            const deltaToIntroStart = Math.abs(nearestPair.start - start);
+            if (durationDelta <= autoOpAlignmentConfig.chapterPairDurationTolerance
+                && deltaToIntroStart <= autoOpAlignmentConfig.chapterPairMaxStartDelta
+            ) {
+                console.log(`[自动OP] Intro 时长异常，改用章节对确认 OP: ${duration.toFixed(1)}s -> ${nearestPair.duration.toFixed(1)}s`);
+                return {
+                    start: nearestPair.start,
+                    end: nearestPair.end,
+                    duration: nearestPair.duration,
+                    chapterContext,
+                    markerStart: start,
+                    markerEnd: end,
+                    markerDuration: duration,
+                    chapterPairConfirmed: true,
+                };
+            }
+        }
+        console.log(`[自动OP] Intro 时长异常，跳过自动对齐: ${duration.toFixed(1)}s`);
+        return null;
+    }
+
+    function extractIntroInfoFromChapters(chapters) {
+        return buildIntroInfoFromChapters(chapters);
+    }
+
+    function resolveIntroInfo(item, fullItem) {
+        const currentIntroInfo = buildIntroInfoFromChapters(item?.Chapters, 'item.Chapters');
+        if (currentIntroInfo) {
+            return { ...currentIntroInfo, source: 'item.Chapters' };
+        }
+        const fullIntroInfo = buildIntroInfoFromChapters(fullItem?.Chapters, 'fullItem.Chapters');
+        if (fullIntroInfo) {
+            return { ...fullIntroInfo, source: 'fullItem.Chapters' };
+        }
+        return null;
+    }
+
+    function detectChapterPairOpConfirmation(introInfo) {
+        if (!autoOpAlignmentConfig.chapterPairConfirmEnable || !introInfo?.chapterContext?.nearestPair) {
+            return {
+                confirmed: false,
+                reason: '未命中原生章节对',
+            };
+        }
+        const pair = introInfo.chapterContext.nearestPair;
+        const targetDuration = autoOpAlignmentConfig.chapterPairTargetDuration;
+        const durationTolerance = autoOpAlignmentConfig.chapterPairDurationTolerance;
+        const maxStartDelta = autoOpAlignmentConfig.chapterPairMaxStartDelta;
+        const compareStart = Number.isFinite(introInfo.markerStart) ? introInfo.markerStart : introInfo.start;
+        const deltaToIntroStart = Math.abs(pair.start - compareStart);
+        const durationDelta = Math.abs(pair.duration - targetDuration);
+        if (durationDelta > durationTolerance) {
+            return {
+                confirmed: false,
+                pairStart: pair.start,
+                pairEnd: pair.end,
+                pairDuration: pair.duration,
+                deltaToIntroStart,
+                reason: '原生章节对时长未命中约90秒范围',
+            };
+        }
+        if (deltaToIntroStart > maxStartDelta) {
+            return {
+                confirmed: false,
+                pairStart: pair.start,
+                pairEnd: pair.end,
+                pairDuration: pair.duration,
+                deltaToIntroStart,
+                reason: '原生章节对起点与 IntroStart 距离过大',
+            };
+        }
+        return {
+            confirmed: true,
+            pairStart: pair.start,
+            pairEnd: pair.end,
+            pairDuration: pair.duration,
+            deltaToIntroStart,
+            reason: introInfo.chapterPairConfirmed ? '命中原生章节对确认 OP，并已改用章节对边界' : '命中原生章节对确认 OP',
+        };
+    }
+
+    function matchDanmakuKeyword(text, keywords) {
+        if (!text) { return false; }
+        return keywords.some(keyword => {
+            try {
+                if (keyword instanceof RegExp) {
+                    return keyword.test(text);
+                }
+                return new RegExp(keyword, 'i').test(text);
+            } catch (error) {
+                return text.toLowerCase().includes(String(keyword).toLowerCase());
+            }
+        });
+    }
+
+    function isSkipLikeOpDanmakuKeyword(text) {
+        if (!text) { return false; }
+        if (matchDanmakuKeyword(text, autoOpAlignmentConfig.skipKeywords)) {
+            return true;
+        }
+        return /跳\s*op/i.test(text) && !/不跳\s*op/i.test(text);
+    }
+
+    function matchOpDanmakuKeyword(text) {
+        if (!text) {
+            return { matched: false, negative: false, weight: 0, isStrong: false, isSkipLike: false };
+        }
+        if (matchDanmakuKeyword(text, autoOpAlignmentConfig.negativeKeywords)) {
+            return { matched: false, negative: true, weight: 0, isStrong: false, isSkipLike: false };
+        }
+        const matched = matchDanmakuKeyword(text, autoOpAlignmentConfig.positiveKeywords);
+        if (!matched) {
+            return { matched: false, negative: false, weight: 0, isStrong: false, isSkipLike: false };
+        }
+        const isStrong = matchDanmakuKeyword(text, autoOpAlignmentConfig.strongKeywords);
+        const isSkipLike = isSkipLikeOpDanmakuKeyword(text);
+        let weight = 1;
+        if (isStrong) {
+            weight += 1.2;
+        }
+        if (/不跳\s*op/i.test(text)) {
+            weight += 0.5;
+        }
+        if (/空降成功/i.test(text)) {
+            weight -= 0.8;
+        } else if (isSkipLike) {
+            weight -= 0.35;
+        }
+        return {
+            matched: true,
+            negative: false,
+            weight: Math.max(0.2, weight),
+            isStrong,
+            isSkipLike,
+        };
+    }
+
+    function getRawCommentTime(comment) {
+        if (!comment?.p) { return null; }
+        const values = comment.p.split(',');
+        const rawTime = parseFloat(values[0]);
+        return Number.isFinite(rawTime) ? rawTime : null;
+    }
+
+    function collectOpKeywordComments(comments, introInfo, baseOffset = 0) {
+        if (!introInfo) {
+            return { commentsInWindow: [], keywordComments: [], windowStart: 0, windowEnd: 0 };
+        }
+        const windowStart = Math.max(0, introInfo.start - autoOpAlignmentConfig.windowPaddingBefore);
+        const windowEnd = Math.min(introInfo.end + autoOpAlignmentConfig.windowPaddingAfter, introInfo.start + autoOpAlignmentConfig.windowMaxEndOffset);
+        const commentsInWindow = [];
+        const keywordComments = [];
+        comments.forEach(comment => {
+            const rawTime = getRawCommentTime(comment);
+            if (rawTime === null) {
+                return;
+            }
+            const adjustedTime = rawTime + baseOffset;
+            if (adjustedTime < windowStart || adjustedTime > windowEnd) {
+                return;
+            }
+            const keywordSignal = matchOpDanmakuKeyword(comment.m || '');
+            const normalized = { ...comment, rawTime, adjustedTime, keywordSignal };
+            commentsInWindow.push(normalized);
+            if (keywordSignal.matched) {
+                keywordComments.push(normalized);
+            }
+        });
+        return { commentsInWindow, keywordComments, windowStart, windowEnd };
+    }
+
+    function scoreOpBuckets(commentsInWindow, keywordComments, windowStart, windowEnd, introInfo) {
+        const bucketSize = autoOpAlignmentConfig.bucketSize;
+        const clusterWindowSize = autoOpAlignmentConfig.clusterWindowSize;
+        const bucketMap = new Map();
+        commentsInWindow.forEach(comment => {
+            const bucket = Math.floor((comment.adjustedTime - windowStart) / bucketSize);
+            const existing = bucketMap.get(bucket) || {
+                start: windowStart + bucket * bucketSize,
+                all: [],
+                hits: [],
+                weightedHits: 0,
+                strongKeywordHits: 0,
+                skipLikeHits: 0,
+            };
+            existing.all.push(comment);
+            bucketMap.set(bucket, existing);
+        });
+        keywordComments.forEach(comment => {
+            const bucket = Math.floor((comment.adjustedTime - windowStart) / bucketSize);
+            const existing = bucketMap.get(bucket) || {
+                start: windowStart + bucket * bucketSize,
+                all: [],
+                hits: [],
+                weightedHits: 0,
+                strongKeywordHits: 0,
+                skipLikeHits: 0,
+            };
+            existing.hits.push(comment);
+            existing.weightedHits += comment.keywordSignal?.weight || 1;
+            if (comment.keywordSignal?.isStrong) {
+                existing.strongKeywordHits += 1;
+            }
+            if (comment.keywordSignal?.isSkipLike) {
+                existing.skipLikeHits += 1;
+            }
+            bucketMap.set(bucket, existing);
+        });
+        const bucketCount = Math.max(1, Math.ceil((windowEnd - windowStart) / bucketSize));
+        const buckets = Array.from({ length: bucketCount }, (_, index) => bucketMap.get(index) || {
+            start: windowStart + index * bucketSize,
+            all: [],
+            hits: [],
+            weightedHits: 0,
+            strongKeywordHits: 0,
+            skipLikeHits: 0,
+        });
+        const windowBucketSpan = Math.max(1, Math.ceil(clusterWindowSize / bucketSize));
+        const scoredWindows = [];
+        for (let i = 0; i < buckets.length; i++) {
+            const windowBuckets = buckets.slice(i, i + windowBucketSpan);
+            if (windowBuckets.length === 0) { continue; }
+            const allComments = windowBuckets.flatMap(bucket => bucket.all);
+            const hitComments = windowBuckets.flatMap(bucket => bucket.hits);
+            if (allComments.length === 0) { continue; }
+            const weightedHits = windowBuckets.reduce((sum, bucket) => sum + bucket.weightedHits, 0);
+            const strongKeywordHits = windowBuckets.reduce((sum, bucket) => sum + bucket.strongKeywordHits, 0);
+            const skipLikeHits = windowBuckets.reduce((sum, bucket) => sum + bucket.skipLikeHits, 0);
+            const keywordRatio = hitComments.length / allComments.length;
+            const weightedKeywordRatio = weightedHits / Math.max(allComments.length, 1);
+            const start = windowBuckets[0].start;
+            const end = windowBuckets[windowBuckets.length - 1].start + bucketSize;
+            const windowCenter = (start + end) / 2;
+            const distancePenalty = Math.max(0, Math.abs(windowCenter - introInfo.start) - autoOpAlignmentConfig.startFocusGrace)
+                * autoOpAlignmentConfig.distancePenaltyWeight;
+            const postIntroPenalty = windowCenter > introInfo.end ? autoOpAlignmentConfig.postIntroPenalty : 0;
+            const score = weightedHits * 2.4
+                + strongKeywordHits * 2
+                + weightedKeywordRatio * 8
+                + keywordRatio * 2
+                - allComments.length * autoOpAlignmentConfig.commentCountPenaltyWeight
+                - skipLikeHits * autoOpAlignmentConfig.skipKeywordPenaltyWeight
+                - distancePenalty
+                - postIntroPenalty;
+            scoredWindows.push({
+                start,
+                end,
+                allComments,
+                hitComments,
+                keywordRatio,
+                weightedKeywordRatio,
+                weightedHits,
+                strongKeywordHits,
+                skipLikeHits,
+                score,
+            });
+        }
+        scoredWindows.sort((a, b) => b.score - a.score);
+        return scoredWindows;
+    }
+
+    function detectEarlyOpAnchor(keywordComments, introInfo) {
+        if (!introInfo || !Array.isArray(keywordComments) || keywordComments.length === 0) {
+            return null;
+        }
+        const strongKeywordComments = keywordComments
+            .filter(comment => comment.keywordSignal?.isStrong)
+            .sort((a, b) => a.adjustedTime - b.adjustedTime);
+        if (strongKeywordComments.length === 0) {
+            return null;
+        }
+        const anchorMinTime = introInfo.start + autoOpAlignmentConfig.earlyAnchorMinOffset;
+        const anchorMaxTime = introInfo.start + autoOpAlignmentConfig.earlyAnchorMaxOffset;
+        const earlyAnchorComments = strongKeywordComments.filter(comment => comment.adjustedTime >= anchorMinTime && comment.adjustedTime <= anchorMaxTime);
+        const hasEnoughAnchorHits = earlyAnchorComments.length >= autoOpAlignmentConfig.earlyAnchorMinStrongHits
+            || (earlyAnchorComments.length === 1
+                && strongKeywordComments.length >= autoOpAlignmentConfig.earlyAnchorSingleHitMinStrongTotal);
+        if (!hasEnoughAnchorHits) {
+            return null;
+        }
+        const anchorComment = earlyAnchorComments[0];
+        return {
+            opClusterTime: anchorComment.adjustedTime,
+            autoOffset: introInfo.start - anchorComment.adjustedTime,
+            earlyAnchorStrongHits: earlyAnchorComments.length,
+            strongKeywordCount: strongKeywordComments.length,
+        };
+    }
+
+    function detectOpDanmakuCluster(comments, introInfo, baseOffset = 0) {
+        if (!introInfo) {
+            return { status: 'fallback', reason: '未获取到 Intro 标记' };
+        }
+        const chapterPairConfirmation = detectChapterPairOpConfirmation(introInfo);
+        const { commentsInWindow, keywordComments, windowStart, windowEnd } = collectOpKeywordComments(comments, introInfo, baseOffset);
+        if (commentsInWindow.length < autoOpAlignmentConfig.minWindowComments) {
+            return { status: 'fallback', reason: 'Intro 附近弹幕过少', chapterPairConfirmation };
+        }
+        if (keywordComments.length < autoOpAlignmentConfig.minKeywordHits) {
+            return { status: 'fallback', reason: 'OP 关键词弹幕不足', chapterPairConfirmation };
+        }
+        const scoredWindows = scoreOpBuckets(commentsInWindow, keywordComments, windowStart, windowEnd, introInfo);
+        if (scoredWindows.length === 0) {
+            return { status: 'fallback', reason: '未找到 OP 候选时间窗', chapterPairConfirmation };
+        }
+        const bestWindow = scoredWindows[0];
+        const earlyAnchor = detectEarlyOpAnchor(keywordComments, introInfo);
+        let opClusterTime = null;
+        let offset = null;
+        let clusterStrategy = null;
+        let confidence = 0;
+        let clusterKeywordHits = 0;
+        let strongKeywordHits = 0;
+        let strongKeywordCount = 0;
+        let reason = '';
+        if (earlyAnchor) {
+            opClusterTime = earlyAnchor.opClusterTime;
+            offset = earlyAnchor.autoOffset;
+            clusterStrategy = 'early-anchor';
+            confidence = 1;
+            clusterKeywordHits = earlyAnchor.earlyAnchorStrongHits;
+            strongKeywordHits = earlyAnchor.earlyAnchorStrongHits;
+            strongKeywordCount = earlyAnchor.strongKeywordCount;
+            reason = '命中 Intro 起点附近的早期 OP 锚点';
+        } else {
+            return {
+                status: 'fallback',
+                reason: chapterPairConfirmation.confirmed
+                    ? '命中原生章节对确认，但未命中早期 OP 锚点'
+                    : '未命中 Intro 起点附近的早期 OP 锚点',
+                chapterPairConfirmation,
+            };
+        }
+        if (Math.abs(offset) > autoOpAlignmentConfig.hardMaxOffset) {
+            return { status: 'fallback', reason: '自动估算偏移超过硬上限', chapterPairConfirmation };
+        }
+        if (Math.abs(offset) > autoOpAlignmentConfig.maxAcceptedOffset) {
+            return { status: 'fallback', reason: '自动估算偏移超过安全范围', chapterPairConfirmation };
+        }
+        return {
+            status: 'applied',
+            introInfo,
+            opClusterTime,
+            autoOffset: offset,
+            confidence,
+            keywordHits: keywordComments.length,
+            clusterKeywordHits,
+            strongKeywordHits,
+            strongKeywordCount,
+            weightedHits: bestWindow.weightedHits,
+            windowCommentCount: bestWindow.allComments.length,
+            keywordRatio: bestWindow.keywordRatio,
+            weightedKeywordRatio: bestWindow.weightedKeywordRatio,
+            score: bestWindow.score,
+            clusterStrategy,
+            chapterPairConfirmation,
+            chapterPairConfirmed: chapterPairConfirmation.confirmed,
+            reason,
+        };
+    }
+
+    async function refreshAutoTimelineOffset(comments, introInfo) {
+        const manualOffset = getManualTimelineOffset();
+        const enabled = lsGetItem(lsKeys.autoOpAlignEnable.id);
+        const currentEpisodeInfo = window.ede?.episode_info || {};
+        const metaBase = {
+            enabled,
+            introInfo: introInfo || null,
+            manualOffset,
+            autoOffset: 0,
+            effectiveOffset: manualOffset,
+        };
+        if (!enabled) {
+            window.ede.autoTimelineOffset = 0;
+            window.ede.autoTimelineOffsetMeta = { ...metaBase, status: 'disabled', reason: '用户已关闭自动 OP 对齐' };
+            return window.ede.autoTimelineOffsetMeta;
+        }
+        if (!introInfo) {
+            const seasonBaselineNoIntro = await ensureSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo);
+            if (seasonBaselineNoIntro) {
+                window.ede.autoTimelineOffset = seasonBaselineNoIntro.offset;
+                window.ede.autoTimelineOffsetMeta = {
+                    ...metaBase,
+                    status: 'applied',
+                    sourceType: 'season-baseline',
+                    introInfo: null,
+                    autoOffset: seasonBaselineNoIntro.offset,
+                    effectiveOffset: manualOffset + seasonBaselineNoIntro.offset,
+                    seasonSampleCount: seasonBaselineNoIntro.sampleCount,
+                    seasonEpisodeNumbers: seasonBaselineNoIntro.samples.map(sample => sample.episodeNumber),
+                    seasonBaselineStrategy: seasonBaselineNoIntro.strategy || 'standard',
+                    seasonBaselineOffset: seasonBaselineNoIntro.offset,
+                    seasonEffectiveOffset: manualOffset + seasonBaselineNoIntro.offset,
+                    currentEpisodeReason: '当前集无 Intro 标记，已回退到季度基线',
+                    reason: '当前集无 Intro 标记，使用季度自动偏移基线',
+                };
+                console.log('[自动OP] 当前集无 Intro，使用季度基线:', window.ede.autoTimelineOffsetMeta);
+                return window.ede.autoTimelineOffsetMeta;
+            }
+            window.ede.autoTimelineOffset = 0;
+            window.ede.autoTimelineOffsetMeta = { ...metaBase, status: 'fallback', reason: '未获取到 Intro 标记' };
+            return window.ede.autoTimelineOffsetMeta;
+        }
+        const detection = detectOpDanmakuCluster(comments, introInfo, manualOffset);
+        if (detection.status === 'applied') {
+            const seasonBaseline = await ensureSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo);
+            window.ede.autoTimelineOffset = detection.autoOffset;
+            window.ede.autoTimelineOffsetMeta = {
+                ...metaBase,
+                ...detection,
+                sourceType: 'current-episode',
+                effectiveOffset: manualOffset + detection.autoOffset,
+                seasonSampleCount: seasonBaseline?.sampleCount || 0,
+                seasonEpisodeNumbers: seasonBaseline?.samples?.map(sample => sample.episodeNumber) || [],
+                seasonBaselineStrategy: seasonBaseline?.strategy,
+                seasonBaselineOffset: seasonBaseline?.offset,
+            };
+            console.log('[自动OP] 自动对齐成功:', window.ede.autoTimelineOffsetMeta);
+            return window.ede.autoTimelineOffsetMeta;
+        }
+        const seasonBaseline = await ensureSeasonAutoTimelineOffsetBaseline(currentEpisodeInfo);
+        if (seasonBaseline) {
+            window.ede.autoTimelineOffset = seasonBaseline.offset;
+            window.ede.autoTimelineOffsetMeta = {
+                ...metaBase,
+                ...detection,
+                status: 'applied',
+                sourceType: 'season-baseline',
+                autoOffset: seasonBaseline.offset,
+                effectiveOffset: manualOffset + seasonBaseline.offset,
+                seasonSampleCount: seasonBaseline.sampleCount,
+                seasonEpisodeNumbers: seasonBaseline.samples.map(sample => sample.episodeNumber),
+                seasonBaselineStrategy: seasonBaseline.strategy || 'standard',
+                seasonEffectiveOffset: manualOffset + seasonBaseline.offset,
+                currentEpisodeReason: detection.reason || '当前集自动对齐未命中',
+                reason: `${detection.reason || '当前集自动对齐未命中'}，已回退到季度自动基线`,
+            };
+            console.log('[自动OP] 当前集回退到季度基线:', window.ede.autoTimelineOffsetMeta);
+            return window.ede.autoTimelineOffsetMeta;
+        }
+        window.ede.autoTimelineOffset = 0;
+        window.ede.autoTimelineOffsetMeta = { ...metaBase, ...detection, autoOffset: 0, effectiveOffset: manualOffset };
+        console.log('[自动OP] 回退到手动轴偏秒:', window.ede.autoTimelineOffsetMeta);
+        return window.ede.autoTimelineOffsetMeta;
+    }
 
     class AppLogAspect {
         constructor() {
@@ -671,8 +1529,9 @@
     }
 
     function onPlaybackStart(e, state) {
-        console.log(e.type);
-        const itemId = state?.NowPlayingItem?.Id || state?.ItemId || '';
+        const playbackState = state || (e?.NowPlayingItem || e?.PlayState || e?.ItemId ? e : null);
+        console.log(e?.type || 'playbackstart');
+        const itemId = playbackState?.NowPlayingItem?.Id || playbackState?.ItemId || '';
         const sessionChanged = lastPlaybackItemId && itemId && lastPlaybackItemId !== itemId;
         if (sessionChanged) {
             cleanupPlaybackSession();
@@ -692,14 +1551,17 @@
         if (itemId) {
             window.ede.itemId = itemId;
         }
+        resetAutoTimelineOffsetState();
         loadDanmaku(LOAD_TYPE.INIT);
     }
 
     function onPlaybackStop(e, state) {
-        console.log(e.type);
-        if (state) {
-            onPlaybackStopPct(e, state);
+        const playbackState = state || (e?.NowPlayingItem || e?.PlayState || e?.ItemId ? e : null);
+        console.log(e?.type || 'playbackstop');
+        if (playbackState) {
+            onPlaybackStopPct({ type: e?.type || 'playbackstop' }, playbackState);
         }
+        resetAutoTimelineOffsetState();
         if (lsGetItem(lsKeys.osdHeaderClockEnable.id)) {
             removeHeaderClock();
         }
@@ -1348,9 +2210,11 @@
 
     async function getMapByEmbyItemInfo() {
         let item = await getEmbyItemInfo();
+        let fullItem = null;
         if (!item) {
             // this only working on quickDebug
             item = await fatchEmbyItemInfo(window.ede.itemId);
+            fullItem = item;
         }
         if (!item) { return null; } // getEmbyItemInfo from playbackManager null, will next called
         if (!['Episode', 'Movie'].includes(item.Type)) {
@@ -1393,19 +2257,29 @@
         }
 
         // 检查是否需要重新获取完整的item信息
-        if (!item.MediaSources || item.MediaSources.length === 0) {
-            console.log(`[Stream] MediaSources为空，通过API重新获取完整信息...`);
+        if (!item.MediaSources || item.MediaSources.length === 0 || !Array.isArray(item.Chapters)) {
+            console.log(`[Stream] MediaSources或Chapters缺失，通过API重新获取完整信息...`);
             try {
-                const fullItem = await fatchEmbyItemInfo(item.Id);
-                if (fullItem && fullItem.MediaSources && fullItem.MediaSources.length > 0) {
-                    item = fullItem;
-                    console.log(`[Stream] 重新获取成功，MediaSources数量: ${item.MediaSources.length}`);
-                } else {
-                    console.warn(`[Stream] 重新获取失败或仍无MediaSources`);
+                fullItem = await fatchEmbyItemInfo(item.Id);
+                if (fullItem) {
+                    if (fullItem.MediaSources && fullItem.MediaSources.length > 0) {
+                        item = { ...item, ...fullItem };
+                        console.log(`[Stream] 重新获取成功，MediaSources数量: ${item.MediaSources.length}`);
+                    } else {
+                        console.warn(`[Stream] 重新获取失败或仍无MediaSources`);
+                    }
                 }
             } catch (error) {
                 console.error(`[Stream] 重新获取item信息失败:`, error);
             }
+        }
+
+        const introInfo = resolveIntroInfo(item, fullItem);
+        window.ede.introInfo = introInfo;
+        if (introInfo) {
+            console.log('[自动OP] Intro 标记:', introInfo);
+        } else {
+            console.log('[自动OP] 当前媒体未获取到 Intro 标记');
         }
 
         const mediaSource = item.MediaSources && item.MediaSources[0];
@@ -1486,6 +2360,7 @@
             originalTitle,  // Emby 的原语言标题
             premiereDate,   // 首播日期（Series 或 Movie）
             embyEpisodeTitle, // Emby 当前集标题（Episode）
+            introInfo,
         };
     }
 
@@ -2259,6 +3134,7 @@
         if (!itemInfoMap) { return null; }
         const { _episode_key, animeId, episode, seriesOrMovieId, seasonNumber, seasonCacheId } = itemInfoMap;
         syncTimelineOffsetBySeason(seasonCacheId);
+        window.ede.introInfo = itemInfoMap.introInfo || null;
 
         // 集数推理逻辑（基于 DandanPlay episodeId 连续的特性）
         // 从 localStorage 读取上次播放的剧集信息
@@ -2412,6 +3288,7 @@
                         imageUrl: previous_info.imageUrl,
                         seriesOrMovieId: seriesOrMovieId,
                         episodeIndex: currentEpisodeNumber - 1,
+                        introInfo: itemInfoMap.introInfo || previous_info.introInfo || null,
                     };
                     // 推理成功后更新 localStorage，确保后续推理/重播使用正确的基准
                     localStorage.setItem(lsLocalKeys.previousEpisodeInfo, JSON.stringify(predictedEpisodeInfo));
@@ -2469,6 +3346,7 @@
                 seriesOrMovieId: seriesOrMovieId,
                 seasonNumber: itemInfoMap.seasonNumber,
                 seasonCacheId: itemInfoMap.seasonCacheId,
+                introInfo: itemInfoMap.introInfo || null,
             };
             window.localStorage.setItem(unique_episode_key, JSON.stringify(episodeInfo));
             // 预先获取完整 episodes 列表并缓存，供后续推理匹配使用
@@ -2506,6 +3384,7 @@
             seriesOrMovieId: seriesOrMovieId,
             seasonNumber: itemInfoMap.seasonNumber,
             seasonCacheId: itemInfoMap.seasonCacheId,
+            introInfo: itemInfoMap.introInfo || null,
         };
         localStorage.setItem(unique_episode_key, JSON.stringify(episodeInfo));
         // 缓存 anime 的 episodes 数组，用于推理匹配时获取真实 episodeTitle
@@ -2577,6 +3456,7 @@
             window.ede.danmaku = null;
         }
         window.ede.commentsOriginal = comments;
+        await refreshAutoTimelineOffset(comments, window.ede.episode_info?.introInfo || window.ede.introInfo);
         const commentsParsed = danmakuParser(comments);
         window.ede.commentsParsed = commentsParsed;
         let _comments = danmakuFilter(commentsParsed);
@@ -2732,9 +3612,11 @@
                             if (danmakuCtrEle && danmakuCtrEle.style.opacity !== '1') {
                                 danmakuCtrEle.style.opacity = '1';
                             }
-                            const videoOsdDanmakuTitle = getById(eleIds.videoOsdDanmakuTitle);
+                            const summary = getAutoTimelineOffsetSummary();
+                            const videoOsdContainer = document.querySelector(`${mediaContainerQueryStr} .videoOsdSecondaryText`);
+                            const videoOsdDanmakuTitle = getById(eleIds.videoOsdDanmakuTitle, videoOsdContainer);
                             if (videoOsdDanmakuTitle && videoOsdDanmakuTitle.innerText.includes('未匹配')) {
-                                videoOsdDanmakuTitle.innerText = `弹幕：${lsKeys.useFetchPluginXml.name} - ${comments.length}条`;
+                                videoOsdDanmakuTitle.innerText = `弹幕：${lsKeys.useFetchPluginXml.name} - ${comments.length}条 - ${summary.text}`;
                             }
                         }).catch((error) => {
                             console.error(error);
@@ -3073,7 +3955,7 @@
         // 弹幕透明度
         const fontOpacity = Math.round(lsGetItem(lsKeys.fontOpacity.id) * 255).toString(16).padStart(2, '0');
         // 时间轴偏移秒数
-        const timelineOffset = lsGetItem(lsKeys.timelineOffset.id);
+        const timelineOffset = getEffectiveTimelineOffset();
         const sourceUidReg = /\[(.*)\](.*)/;
         const showSourceIds = lsGetItem(lsKeys.showSource.id);
         // const removeEmojiEnable = lsGetItem(lsKeys.removeEmojiEnable.id);
@@ -3565,9 +4447,9 @@
                     <h4>匹配源</h4>
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <div id="${eleIds.currentMatchedDiv}">
-                                <label class="${classes.embyLabel}">弹弹 play 总量: ${comments.length}</label>
-                            </div>
+                <div id="${eleIds.currentMatchedDiv}">
+                    <label class="${classes.embyLabel}">弹弹 play 总量: ${comments.length}</label>
+                </div>
                             <label class="${classes.embyLabel}">弹弹 play 附加的第三方 url: </label>
                         </div>
                         <button is="emby-button" type="button"
@@ -3643,6 +4525,7 @@
                     lsLocalKeys.bgmtvBangumiPrefix,
                     lsLocalKeys.animeEpisodesPrefix,
                     lsLocalKeys.timelineOffsetPrefix,
+                    lsLocalKeys.seasonAutoTimelineOffsetPrefix,
                     lsLocalKeys.previousEpisodeInfo,
                 ];
                 lsBatchRemove(prefixesToClear);
@@ -3802,6 +4685,17 @@
         const { episodeTitle, animeId, animeTitle, apiName } = window.ede.episode_info || {};
         const loadSum = getDanmakuComments(window.ede).length;
         const downloadSum = window.ede.commentsParsed.length;
+        const autoAlignSummary = getAutoTimelineOffsetSummary();
+        const autoAlignMeta = window.ede.autoTimelineOffsetMeta;
+        const seasonSampleInfo = autoAlignMeta?.seasonSampleCount
+            ? `季度样本: ${autoAlignMeta.seasonSampleCount}集 [${(autoAlignMeta.seasonEpisodeNumbers || []).join(', ') || '--'}], 基线策略: ${autoAlignMeta?.seasonBaselineStrategy || 'standard'}`
+            : '季度样本: --';
+        const seasonBaselineInfo = typeof autoAlignMeta?.seasonBaselineOffset === 'number'
+            ? `季度基线: ${formatOffsetSeconds(autoAlignMeta.seasonBaselineOffset)}`
+            : '季度基线: --';
+        const chapterPairInfo = autoAlignMeta?.chapterPairConfirmation?.pairStart !== undefined
+            ? `章节对确认: ${autoAlignMeta?.chapterPairConfirmed ? '是' : '否'}, 章节对: ${safeFixed(autoAlignMeta.chapterPairConfirmation.pairStart)}s ~ ${safeFixed(autoAlignMeta.chapterPairConfirmation.pairEnd)}s (${safeFixed(autoAlignMeta.chapterPairConfirmation.pairDuration)}s), Intro差值: ${safeFixed(autoAlignMeta.chapterPairConfirmation.deltaToIntroStart)}s`
+            : '章节对确认: --';
         let template = `
             <div style="display: flex;">
                 <div id="${eleIds.posterImgDiv}"></div>
@@ -3826,6 +4720,24 @@
                             获取总数: ${downloadSum},
                             加载总数: ${loadSum},
                             被过滤数: ${downloadSum - loadSum}
+                        </div>
+                    </div>
+                    <div>
+                        <label class="${classes.embyLabel}">自动对齐: </label>
+                        <div class="${classes.embyFieldDesc}">
+                            ${autoAlignSummary.text}<br>
+                            手动偏移: ${formatOffsetSeconds(getManualTimelineOffset())},
+                            自动偏移: ${formatOffsetSeconds(autoAlignMeta?.autoOffset)},
+                            最终偏移: ${formatOffsetSeconds(autoAlignMeta?.effectiveOffset ?? getEffectiveTimelineOffset())}<br>
+                            ${seasonBaselineInfo}<br>
+                            ${seasonSampleInfo}<br>
+                            ${chapterPairInfo}<br>
+                            Intro: ${formatIntroInfo(autoAlignMeta?.introInfo || window.ede.episode_info?.introInfo || window.ede.introInfo)}<br>
+                            OP簇: ${safeFixed(autoAlignMeta?.opClusterTime)}s,
+                            命中: ${autoAlignMeta?.clusterKeywordHits ?? 0}/${autoAlignMeta?.keywordHits ?? 0},
+                            置信度: ${safeFixed(autoAlignMeta?.confidence, 2)},
+                            策略: ${autoAlignMeta?.clusterStrategy || '--'}<br>
+                            说明: ${autoAlignSummary.detail}
                         </div>
                     </div>
                 </div>
@@ -4126,6 +5038,15 @@
         //         lsSetItem(lsKeys.removeEmojiEnable.id, checked);
         //     }
         // ));
+        getById(eleIds.extCheckboxDiv, container).append(embyCheckbox(
+            { label: lsKeys.autoOpAlignEnable.name }, lsGetItem(lsKeys.autoOpAlignEnable.id), (checked) => {
+                lsSetItem(lsKeys.autoOpAlignEnable.id, checked);
+                if (!checked) {
+                    resetAutoTimelineOffsetState();
+                }
+                loadDanmaku(LOAD_TYPE.RELOAD);
+            }
+        ));
         getById(eleIds.extCheckboxDiv, container).append(embyCheckbox(
             { label: lsKeys.enablePreciseHash.name + ' (需下载16MB)' },
             lsGetItem(lsKeys.enablePreciseHash.id),
@@ -4690,11 +5611,12 @@
             videoOsdDanmakuTitle.classList.add(classes.videoOsdTitle);
             videoOsdDanmakuTitle.style = 'margin-left: auto; white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word; position: absolute; right: 0px; bottom: 0px;';
         }
+        const autoAlignSummary = getAutoTimelineOffsetSummary();
         let text = '弹幕：';
         if (episodeId) {
-            text += `${animeTitle} - ${episodeTitle} - ${loadSum}条`;
+            text += `${animeTitle} - ${episodeTitle} - ${loadSum}条 - ${autoAlignSummary.text}`;
         } else {
-            text += `未匹配`;
+            text += `未匹配 - ${autoAlignSummary.text}`;
         }
         videoOsdDanmakuTitle.innerText = text;
         if (videoOsdContainer) {
@@ -4897,6 +5819,7 @@
             seasonCacheId: seasonCacheId,
             apiPrefix: anime.apiPrefix,
             apiName: anime.apiName,
+            introInfo: window.ede.introInfo || window.ede.episode_info?.introInfo || null,
         };
         const seasonInfo = {
             name: anime.animeTitle,
@@ -5449,7 +6372,7 @@
             .map(([key, value]) => [value.id, value.defaultValue])
         );
         lsBatchSet(defaultSettings);
-        lsBatchRemove([lsLocalKeys.timelineOffsetPrefix]);
+        lsBatchRemove([lsLocalKeys.timelineOffsetPrefix, lsLocalKeys.seasonAutoTimelineOffsetPrefix]);
     }
 
     function getTimelineOffsetCacheKey(seasonCacheId) {
@@ -5803,6 +6726,7 @@
             videoTimeUpdateInterval(null, false);
             destroyAllInterval();
             syncTimelineOffsetBySeason(ede.episode_info?.seasonCacheId || ede.searchDanmakuOpts?.seasonCacheId);
+            resetAutoTimelineOffsetState();
         } catch (error) {
             console.warn('弹幕播放会话清理失败:', error);
         } finally {
