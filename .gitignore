@@ -1,0 +1,19 @@
+# Local agent and editor state
+/.pi/
+/.vscode/
+
+# Local investigation artifacts
+/api
+/log
+/nul
+/anidb-*
+/bgm-*
+/tmdb-*
+/episodestmdbId=*
+/movie_item
+/bangumi_result.json
+/match_result.json
+
+# Local-only helper scripts
+/bangumisync.py
+/\[231122\]bangumi详情页添加一键跳转脚本✨ 2023年11月22日.js
